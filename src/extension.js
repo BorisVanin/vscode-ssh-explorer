@@ -3,9 +3,36 @@
 const vscode = require('vscode');
 const fs = require('fs');
 const os = require('os');
+const net = require('net');
 const path = require('path');
 const { Client } = require('ssh2');
 const SSHConfig = require('ssh-config');
+
+// How long to wait for the TCP reachability probe before declaring a host
+// offline. This is a LAN device, not the internet — an online host answers in
+// milliseconds, so a short budget keeps an offline host from stalling anything.
+const REACH_TIMEOUT_MS = 800;
+
+// Quick "is the SSH port even open?" check, done before handing off to ssh2 so an
+// offline LAN device fails in ~1s instead of hanging on the OS connect timeout.
+// Resolves true if we can open a TCP socket to host:port, false otherwise.
+function probeReachable(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false)); // EHOSTUNREACH / ECONNREFUSED / etc.
+    socket.connect(port, host);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // ~/.ssh/config parsing
@@ -65,9 +92,10 @@ function connectConfigFor(alias) {
     port,
     username,
     tryKeyboard: true,
-    readyTimeout: 20000,
-    keepaliveInterval: 15000,
-    keepaliveCountMax: 3,
+    readyTimeout: 15000,
+    // Detect a silently-dead peer (host powered off) in ~10s rather than ~45s.
+    keepaliveInterval: 5000,
+    keepaliveCountMax: 2,
     // 'none' first so passwordless/open hosts connect with zero prompts.
     authHandler: ['none', 'agent', 'publickey', 'keyboard-interactive', 'password'],
   };
@@ -97,18 +125,22 @@ class Connection {
     return this.pending;
   }
 
-  _connect() {
+  async _connect() {
+    const conf = connectConfigFor(this.alias);
+
+    if (conf._proxyJump) {
+      throw new Error(
+        `Host "${this.alias}" uses ProxyJump (${conf._proxyJump}), which this extension does not support yet.`);
+    }
+
+    // Fail fast if the device isn't on the LAN, instead of waiting on ssh2's connect.
+    const reachable = await probeReachable(conf.host, conf.port, REACH_TIMEOUT_MS);
+    if (!reachable) {
+      throw vscode.FileSystemError.Unavailable(
+        `SSH Explorer: ${this.alias} (${conf.host}:${conf.port}) is offline or unreachable.`);
+    }
+
     return new Promise((resolve, reject) => {
-      let conf;
-      try {
-        conf = connectConfigFor(this.alias);
-      } catch (e) { return reject(e); }
-
-      if (conf._proxyJump) {
-        return reject(new Error(
-          `Host "${this.alias}" uses ProxyJump (${conf._proxyJump}), which this extension does not support yet.`));
-      }
-
       const client = new Client();
       client.on('keyboard-interactive', (name, instr, lang, prompts, finish) => {
         finish(prompts.map(() => '')); // answer all prompts with empty string
@@ -142,6 +174,10 @@ class Connection {
 // FileSystemProvider over SFTP
 // ---------------------------------------------------------------------------
 
+// Hard ceiling for any single filesystem operation. Without this, a request
+// issued the moment a host dies hangs on the OS TCP timeout (minutes).
+const OP_TIMEOUT_MS = 12000;
+
 function fileTypeFromAttrs(a) {
   if (a.isDirectory && a.isDirectory()) return vscode.FileType.Directory;
   if (a.isFile && a.isFile()) return vscode.FileType.File;
@@ -166,6 +202,12 @@ class SSHFileSystemProvider {
     this._emitter = new vscode.EventEmitter();
     this.onDidChangeFile = this._emitter.event;
     this.conns = new Map();
+
+    // Offline hosts get a "!" badge in the Explorer (via FileDecorationProvider)
+    // instead of error popups. _offline holds the authorities currently down.
+    this._offline = new Set();
+    this._decoEmitter = new vscode.EventEmitter();
+    this.onDidChangeFileDecorations = this._decoEmitter.event;
   }
 
   conn(authority) {
@@ -174,7 +216,69 @@ class SSHFileSystemProvider {
     return c;
   }
 
-  _sftp(uri) { return this.conn(uri.authority).getSftp(); }
+  // Get an SFTP handle, recording the host's online/offline state as a side
+  // effect so the Explorer badge stays in sync. Throws (quietly handled by
+  // callers) when the host is unreachable.
+  async _sftp(uri) {
+    try {
+      const sftp = await this.conn(uri.authority).getSftp();
+      this._setOffline(uri.authority, false);
+      return sftp;
+    } catch (e) {
+      this._setOffline(uri.authority, true);
+      throw e;
+    }
+  }
+
+  // Flip a host's offline state and refresh its Explorer badge if it changed.
+  _setOffline(authority, offline) {
+    if (offline === this._offline.has(authority)) return;
+    if (offline) this._offline.add(authority); else this._offline.delete(authority);
+    const uris = (vscode.workspace.workspaceFolders || [])
+      .filter((f) => f.uri.scheme === 'sshx' && f.uri.authority === authority)
+      .map((f) => f.uri);
+    this._decoEmitter.fire(uris.length ? uris : undefined);
+  }
+
+  // FileDecorationProvider: show a "!" next to an offline host's folder.
+  provideFileDecoration(uri) {
+    if (uri.scheme === 'sshx' && this._offline.has(uri.authority)) {
+      return {
+        badge: '!',
+        tooltip: 'SSH Explorer: host is offline or unreachable',
+        color: new vscode.ThemeColor('list.warningForeground'),
+        propagate: false, // don't bubble up to the parent — show a single "!"
+      };
+    }
+    return undefined;
+  }
+
+  // Kick off a connection in the background and refresh the tree once it's ready.
+  // Used so the Explorer never blocks on connect — it renders immediately and
+  // fills in when (if) the host answers. Offline hosts just get the "!" badge.
+  _warm(uri) {
+    this._sftp(uri).then(
+      () => this._emitter.fire([{ type: vscode.FileChangeType.Changed, uri }]),
+      () => {} // unreachable: badge already set by _sftp; no spinner, no popup
+    );
+  }
+
+  // Backstop for the two operations VS Code calls automatically: if a host dies
+  // mid-session, keepalive (~10s) normally rejects in-flight calls, but this
+  // guarantees the UI can never freeze on stat/readDirectory.
+  _withTimeout(uri, promise) {
+    promise.catch(() => {}); // swallow a late rejection if the timeout already won
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        this.disconnect(uri.authority);
+        this._setOffline(uri.authority, true);
+        reject(vscode.FileSystemError.Unavailable(
+          `SSH Explorer: ${uri.authority} is not responding (timed out after ${OP_TIMEOUT_MS / 1000}s).`));
+      }, OP_TIMEOUT_MS);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
 
   disconnect(authority) {
     const c = this.conns.get(authority);
@@ -183,9 +287,31 @@ class SSHFileSystemProvider {
 
   watch() { return new vscode.Disposable(() => {}); }
 
-  async stat(uri) {
-    const sftp = await this._sftp(uri);
+  // stat/readDirectory are timeout-guarded (auto-called, must never freeze the UI).
+  // Data/bulk ops run uncapped so large transfers aren't cut off; they rely on
+  // keepalive to fail on a dead host.
+  stat(uri) { return this._withTimeout(uri, this._stat(uri)); }
+  readDirectory(uri) { return this._withTimeout(uri, this._readDirectory(uri)); }
+  readFile(uri) { return this._readFile(uri); }
+  writeFile(uri, content) { return this._writeFile(uri, content); }
+  createDirectory(uri) { return this._createDirectory(uri); }
+  delete(uri, options) { return this._delete(uri, options); }
+  rename(oldUri, newUri) { return this._rename(oldUri, newUri); }
+
+  async _stat(uri) {
+    const conn = this.conn(uri.authority);
     const p = uri.path || '/';
+    // Not connected yet → don't block. Render the root as a directory instantly so
+    // the folder node shows, and connect in the background. Deeper paths aren't
+    // known until connected, so report them as not-found (quiet) for now.
+    if (!conn.sftp) {
+      this._warm(uri);
+      if (p === '/' || p === '') {
+        return { type: vscode.FileType.Directory, ctime: 0, mtime: 0, size: 0 };
+      }
+      throw vscode.FileSystemError.FileNotFound(uri);
+    }
+    const sftp = conn.sftp;
     return new Promise((resolve, reject) => {
       sftp.lstat(p, (err, st) => {
         if (err) return reject(toFsError(err, uri));
@@ -201,8 +327,21 @@ class SSHFileSystemProvider {
     });
   }
 
-  async readDirectory(uri) {
-    const sftp = await this._sftp(uri);
+  async _readDirectory(uri) {
+    const conn = this.conn(uri.authority);
+    // Connect on expand: each time a not-yet-connected host is unfolded, actually
+    // try to reach it. The fast probe bounds this to ~1s, so an offline host falls
+    // through to an empty tree + "!" badge instead of blocking. (We don't rely on
+    // a background refresh event — VS Code doesn't reliably re-list a folder from
+    // one, which is why it previously only filled in after a manual refresh.)
+    let sftp = conn.sftp;
+    if (!sftp) {
+      try {
+        sftp = await this._sftp(uri);
+      } catch (e) {
+        return []; // offline/unreachable: empty tree; _sftp already set the badge
+      }
+    }
     const dir = uri.path || '/';
     const list = await new Promise((resolve, reject) => {
       sftp.readdir(dir, (err, l) => err ? reject(toFsError(err, uri)) : resolve(l));
@@ -222,8 +361,16 @@ class SSHFileSystemProvider {
     })));
   }
 
-  async readFile(uri) {
-    const sftp = await this._sftp(uri);
+  async _readFile(uri) {
+    let sftp;
+    try {
+      sftp = await this._sftp(uri);
+    } catch (e) {
+      // Host offline/unreachable. Report not-found rather than a loud "Unavailable"
+      // so background language servers (Pylance, etc.) skip the file quietly
+      // instead of popping a notification. The "!" badge already signals the state.
+      throw vscode.FileSystemError.FileNotFound(uri);
+    }
     return new Promise((resolve, reject) => {
       const chunks = [];
       const stream = sftp.createReadStream(uri.path);
@@ -233,7 +380,7 @@ class SSHFileSystemProvider {
     });
   }
 
-  async writeFile(uri, content) {
+  async _writeFile(uri, content) {
     const sftp = await this._sftp(uri);
     await new Promise((resolve, reject) => {
       const ws = sftp.createWriteStream(uri.path);
@@ -244,14 +391,14 @@ class SSHFileSystemProvider {
     this._emitter.fire([{ type: vscode.FileChangeType.Changed, uri }]);
   }
 
-  async createDirectory(uri) {
+  async _createDirectory(uri) {
     const sftp = await this._sftp(uri);
     await new Promise((resolve, reject) => {
       sftp.mkdir(uri.path, (err) => err ? reject(toFsError(err, uri)) : resolve());
     });
   }
 
-  async delete(uri, options) {
+  async _delete(uri, options) {
     const sftp = await this._sftp(uri);
     await this._rm(sftp, uri.path, options && options.recursive, uri);
     this._emitter.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
@@ -275,7 +422,7 @@ class SSHFileSystemProvider {
     }
   }
 
-  async rename(oldUri, newUri) {
+  async _rename(oldUri, newUri) {
     const sftp = await this._sftp(oldUri);
     await new Promise((resolve, reject) =>
       sftp.rename(oldUri.path, newUri.path, (e) => e ? reject(toFsError(e, oldUri)) : resolve()));
@@ -334,6 +481,7 @@ function activate(context) {
   const provider = new SSHFileSystemProvider();
   context.subscriptions.push(
     vscode.workspace.registerFileSystemProvider('sshx', provider, { isCaseSensitive: true }),
+    vscode.window.registerFileDecorationProvider(provider),
     vscode.commands.registerCommand('sshExplorer.openHost', openHost),
     vscode.commands.registerCommand('sshExplorer.disconnectHost', makeDisconnect(provider)),
   );

@@ -2,7 +2,7 @@
   "name": "ssh-config-explorer",
   "displayName": "SSH Explorer (.ssh/config aware)",
   "description": "Browse remote folders in the Explorer over SFTP, resolving hosts from ~/.ssh/config. No vscode-server, no FUSE.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "BorisVanin",
   "license": "MIT",
   "icon": "icon.png",
