@@ -1,0 +1,62 @@
+{
+  "name": "ssh-config-explorer",
+  "displayName": "SSH Explorer (.ssh/config aware)",
+  "description": "Browse remote folders in the Explorer over SFTP, resolving hosts from ~/.ssh/config. No vscode-server, no FUSE.",
+  "version": "0.1.0",
+  "publisher": "BorisVanin",
+  "license": "MIT",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BorisVanin/vscode-ssh-explorer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/BorisVanin/vscode-ssh-explorer/issues"
+  },
+  "homepage": "https://github.com/BorisVanin/vscode-ssh-explorer#readme",
+  "keywords": [
+    "ssh",
+    "sftp",
+    "remote",
+    "explorer",
+    "ssh-config"
+  ],
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onFileSystem:sshx"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "sshExplorer.openHost",
+        "title": "SSH Explorer: Open Host…"
+      },
+      {
+        "command": "sshExplorer.disconnectHost",
+        "title": "SSH Explorer: Disconnect Host…"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "echo no build step",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "dependencies": {
+    "ssh-config": "^4.4.4",
+    "ssh2": "^1.16.0"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.2.1"
+  }
+}

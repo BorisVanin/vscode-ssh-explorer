@@ -1,0 +1,25 @@
+.vscode/**
+.git/**
+.gitignore
+**/*.map
+**/.eslintrc*
+**/.eslintignore
+**/tsconfig.json
+ssh-explorer-*.vsix
+node_modules/.bin/**
+node_modules/.package-lock.json
+node_modules/**/test/**
+node_modules/**/tests/**
+node_modules/**/example/**
+node_modules/**/examples/**
+node_modules/**/*.md
+node_modules/**/.github/**
+# ssh2 native-module build intermediates (the prebuilt .node binary is kept)
+node_modules/**/build/**/*.o
+node_modules/**/build/**/*.d
+node_modules/**/build/Makefile
+node_modules/**/build/**/Makefile
+node_modules/**/build/config.gypi
+node_modules/**/build/binding.Makefile
+node_modules/**/build/**/.deps/**
+node_modules/**/*.gyp
